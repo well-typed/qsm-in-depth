@@ -1,0 +1,31 @@
+cabal-version:       >=1.10
+name:                qsm-in-depth
+version:             0.1.0.0
+synopsis:            Demo code for the blog post "An in-depth look at quickcheck-state-machine"
+homepage:            https://github.com/well-typed/qsm-in-depth
+license:             BSD3
+license-file:        LICENSE
+author:              Edsko de Vries
+maintainer:          edsko@well-typed.com
+category:            Testing
+build-type:          Simple
+extra-source-files:  CHANGELOG.md
+
+library
+  exposed-modules:     Version1
+                       Version2
+                       Mock
+  build-depends:       base >=4.10
+                     , bifunctors
+                     , containers
+                     , directory
+                     , filepath
+                     , foldl
+                     , pretty-show
+                     , QuickCheck
+                     , quickcheck-state-machine >= 0.6
+                     , random
+                     , temporary
+                     , tree-diff
+  hs-source-dirs:      src
+  default-language:    Haskell2010
