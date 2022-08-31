@@ -11,10 +11,14 @@ category:            Testing
 build-type:          Simple
 extra-source-files:  CHANGELOG.md
 
-library
-  exposed-modules:     Version1
+executable qsm-in-depth
+  main-is:             Main.hs
+  other-modules:       Version1
                        Version2
                        UsingQD
+                       StateModel.Lockstep
+                       StateModel.Lockstep.EnvOf
+                       StateModel.Util
                        Mock
   build-depends:       base >=4.10
                      , bifunctors
@@ -22,10 +26,14 @@ library
                      , directory
                      , filepath
                      , foldl
+                     , mtl
                      , pretty-show
                      , QuickCheck
+                     , quickcheck-dynamic >= 1.1.0
                      , quickcheck-state-machine >= 0.7.1
                      , random
+                     , tasty
+                     , tasty-quickcheck
                      , temporary
                      , tree-diff
   hs-source-dirs:      src
