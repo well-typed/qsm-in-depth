@@ -44,7 +44,7 @@ import qualified Test.QuickCheck         as QC
 import qualified Test.QuickCheck.Monadic as QC
 import qualified Test.QuickCheck.Random  as QC
 
-import           Test.StateMachine
+import           Test.StateMachine hiding (showLabelledExamples)
 import qualified Test.StateMachine.Types       as QSM
 import qualified Test.StateMachine.Types.Rank2 as Rank2
 
@@ -264,8 +264,8 @@ transition m c = after . lockstep m c
 
 precondition :: Model Symbolic -> Cmd :@ Symbolic -> Logic
 precondition (Model _ fs hs) (At c) =
-        forall (toList1 c) (`elem` map fst fs)
-    :&& forall (toList2 c) (`elem` map fst hs)
+        forall (toList1 c) (`member` map fst fs)
+    :&& forall (toList2 c) (`member` map fst hs)
 
 postcondition :: Model Concrete -> Cmd :@ Concrete -> Resp :@ Concrete -> Logic
 postcondition m c r =
@@ -291,10 +291,10 @@ sm root = QSM.StateMachine {
     , postcondition = postcondition
     , invariant     = Nothing
     , generator     = generator
-    , distribution  = Nothing
     , shrinker      = shrinker
     , semantics     = semantics root
     , mock          = symbolicResp
+    , cleanup       = const $ return ()
     }
 
 {-------------------------------------------------------------------------------
