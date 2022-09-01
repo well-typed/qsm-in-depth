@@ -33,6 +33,7 @@ executable qsm-in-depth
                      , quickcheck-state-machine >= 0.7.1
                      , random
                      , tasty
+                     , tasty-hunit
                      , tasty-quickcheck
                      , temporary
                      , tree-diff

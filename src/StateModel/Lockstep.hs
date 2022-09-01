@@ -26,8 +26,10 @@ module StateModel.Lockstep (
   , StateModel.Lockstep.precondition
   , StateModel.Lockstep.postcondition
   , StateModel.Lockstep.arbitraryAction
+  , StateModel.Lockstep.monitoring
     -- * Utilities for running the tests
-  , propLockstep
+  , StateModel.Lockstep.runActions
+  , StateModel.Lockstep.labelledExamples
   ) where
 
 import Control.Monad
@@ -42,6 +44,8 @@ import StateModel.Lockstep.EnvF (EnvF)
 import StateModel.Lockstep.EnvF qualified as EnvF
 import StateModel.Lockstep.GVar (GVar, InterpretOp)
 import StateModel.Lockstep.GVar qualified as GVar
+import Data.Set (Set)
+import qualified Data.Set as Set
 
 {-------------------------------------------------------------------------------
   Lockstep
@@ -114,6 +118,13 @@ class
     -> state
     -> Gen (Any (LockstepAction state))
 
+  tagStep ::
+       Show a
+    => (state, state)
+    -> LockstepAction state a
+    -> ModelValue state a
+    -> [String]
+
 -- | An action in the lock-step model
 type LockstepAction state = Action (Lockstep state)
 
@@ -143,12 +154,12 @@ type ModelFindVariables state = forall proxy a.
 -------------------------------------------------------------------------------}
 
 -- | Think wrapper around 'modelNextState' that constructs the lookup function
-modelNextState' :: forall state a.
+stepModelState :: forall state a.
      InLockstep state
   => Lockstep state
   -> LockstepAction state a
   -> (ModelValue state a, state)
-modelNextState' (Lockstep state env) action =
+stepModelState (Lockstep state env) action =
     modelNextState modelLookUp action state
   where
     modelLookUp :: ModelLookUp state
@@ -156,6 +167,20 @@ modelNextState' (Lockstep state env) action =
         case GVar.lookUpEnvF x env of
           Left  err -> error err -- Ruled out by the precondition
           Right val -> val
+
+-- | Use 'stepModelState' to also update the environment
+stepLockstepState :: forall state a.
+     (InLockstep state, Typeable a)
+  => Lockstep state
+  -> LockstepAction state a
+  -> Var a
+  -> (ModelValue state a, Lockstep state)
+stepLockstepState st@(Lockstep _ env) action var =
+     (modelResp, Lockstep state' (EnvF.insert var modelResp env))
+  where
+    modelResp :: ModelValue state a
+    state'    :: state
+    (modelResp, state') = stepModelState st action
 
 -- | Thin wrapper around 'monadicIO' that allows a separate initialation step
 --
@@ -182,12 +207,7 @@ nextState :: forall state a. (InLockstep state, Typeable a)
   -> LockstepAction state a
   -> Var a
   -> Lockstep state
-nextState st@(Lockstep _ env) action var =
-     Lockstep state' (EnvF.insert var modelResp env)
-  where
-    modelResp :: ModelValue state a
-    state'    :: state
-    (modelResp, state') = modelNextState' st action
+nextState st action = snd . stepLockstepState st action
 
 -- | Default implementation for 'Test.QuickCheck.StateModel.precondition'
 --
@@ -209,7 +229,7 @@ postcondition st action _lookUp a =
     compareEquality (observeReal action a) (observeModel modelResp)
   where
     modelResp :: ModelValue state a
-    modelResp = fst $ modelNextState' st action
+    modelResp = fst $ stepModelState st action
 
     compareEquality ::  Observable state a -> Observable state a -> Maybe String
     compareEquality real mock
@@ -234,6 +254,57 @@ arbitraryAction (Lockstep state env) =
           [] -> Nothing
           xs -> Just $ elements (map GVar.fromVar xs)
 
+monitoring :: forall state a.
+     (InLockstep state, Show a)
+  => (Lockstep state, Lockstep state)
+  -> LockstepAction state a
+  -> LookUp
+  -> a
+  -> Property -> Property
+monitoring (st@(Lockstep before _), Lockstep after _) action _lookUp _realResp =
+    tabulate "Tags" $ tagStep (before, after) action modelResp
+  where
+    modelResp :: ModelValue state a
+    modelResp = fst $ stepModelState st action
+
+{-------------------------------------------------------------------------------
+  Finding labelled examples
+-------------------------------------------------------------------------------}
+
+-- | Tag a list of actions
+--
+-- This is primarily useful for use with QuickCheck's 'labelledExamples':
+-- the 'monitoring' hook from 'StateModel' is not useful here, because it will
+-- be called multiple times during test execution, which means we must use it
+-- with 'tabulate', not 'label'; but 'tabulate' is not supported by
+-- 'labelledExamples'.
+--
+-- So, here we run through the actions independent from 'StateModel', collecting
+-- all tags, and then finish on a /single/ call to 'label' at the end with all
+-- collected tags.
+--
+-- The other advantage of this function over 'runAction' is that we do not need
+-- a test runner here: this uses the model /only/.
+tagActions :: forall proxy state.
+     InLockstep state
+  => proxy state
+  -> Actions (Lockstep state)
+  -> Property
+tagActions _proxy (Actions steps) =
+    go Set.empty Test.QuickCheck.StateModel.initialState steps
+  where
+    go :: Set String -> Lockstep state -> [Step (Lockstep state)] -> Property
+    go tags _state []     = label ("Tags: " ++ show (Set.toList tags)) True
+    go tags  state (s:ss) =
+        case s of
+          var := action ->
+            let (modelResp, state') = stepLockstepState state action var
+                tags' = tagStep
+                          (lockstepModel state, lockstepModel state')
+                          action
+                          modelResp
+            in go (Set.union (Set.fromList tags') tags) state' ss
+
 {-------------------------------------------------------------------------------
   Utilities for running the tests
 -------------------------------------------------------------------------------}
@@ -242,11 +313,14 @@ arbitraryAction (Lockstep state env) =
 --
 -- This is a thin wrapper around 'runActions' that allows for a separate
 -- state initialization step.
-propLockstep ::
+runActions ::
      StateModel state
   => IO st
   -> (st -> RunModel state IO)
   -> Actions state -> Property
-propLockstep initState runner actions =
+runActions initState runner actions =
     monadicInit initState $ \st ->
-      void $ runActions (runner st) actions
+      void $ Test.QuickCheck.StateModel.runActions (runner st) actions
+
+labelledExamples :: InLockstep state => proxy state -> IO ()
+labelledExamples = Test.QuickCheck.labelledExamples . tagActions

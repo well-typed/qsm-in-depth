@@ -27,9 +27,10 @@ import System.Directory qualified as IO
 import System.IO qualified as IO
 import System.IO.Temp (createTempDirectory)
 import Test.Tasty (TestTree, testGroup)
+import Test.Tasty.HUnit (testCase)
 import Test.Tasty.QuickCheck (testProperty)
 
-import Test.QuickCheck (Gen)
+import Test.QuickCheck (Property, Gen)
 import Test.QuickCheck qualified as QC
 import Test.QuickCheck.StateModel
 
@@ -70,9 +71,7 @@ instance StateModel (Lockstep State) where
   precondition    = Lockstep.precondition
   postcondition   = Lockstep.postcondition
   arbitraryAction = Lockstep.arbitraryAction
-
-  monitoring (before, after) action lookUp =
-      QC.tabulate "Tags" . map show . tags before after action lookUp
+  monitoring      = Lockstep.monitoring
 
 deriving instance Show (Action (Lockstep State) a)
 deriving instance Eq   (Action (Lockstep State) a)
@@ -156,6 +155,10 @@ instance InLockstep State where
         -> Either Err a -> ModelValue State (Either Err b)
       liftErr f = ModelErr . fmap f
 
+  arbitraryActionWithVars ::
+       ModelFindVariables State
+    -> State
+    -> Gen (Any (LockstepAction State))
   arbitraryActionWithVars findVars _mock = QC.oneof $ concat [
         withoutVars
       , case findVars (Proxy @((Either Err IO.Handle))) of
@@ -191,6 +194,22 @@ instance InLockstep State where
 
       genString :: Gen String
       genString = QC.sized $ \n -> replicateM n (QC.elements "ABC")
+
+  tagStep ::
+       Show a
+    => (State, State)
+    -> LockstepAction State a
+    -> ModelValue State a
+    -> [String]
+  tagStep (before, after) action result = map (show :: Tag -> String) $
+      case (action, result) of
+        (Read _, ModelErr (Right _)) ->
+          [SuccessfulRead]
+        (Open _, ModelErr (Right _)) ->
+          [ OpenTwo
+          | Set.size (statsOpenedFiles (stateStats after)) > 1
+          ]
+        _otherwise -> []
 
 deriving instance Show (Observable State a)
 deriving instance Eq   (Observable State a)
@@ -232,9 +251,7 @@ catchErr act = catch (Right <$> act) handler
     handler e = maybe (throwIO e) (return . Left) (Mock.fromIOError e)
 
 {-------------------------------------------------------------------------------
-  Statistics
-
-  These statistics support the labelling, below.
+  Statistics and tagging
 -------------------------------------------------------------------------------}
 
 data Stats = Stats {
@@ -255,29 +272,8 @@ updateStats action result stats@Stats{..} =
      _otherwise ->
        stats
 
-{-------------------------------------------------------------------------------
-  Labelling
-
-  TODO: OpenTwo
--------------------------------------------------------------------------------}
-
 data Tag = OpenTwo | SuccessfulRead
   deriving (Show)
-
-tags ::
-     Lockstep State
-  -> Lockstep State
-  -> Action (Lockstep State) a
-  -> LookUp
-  -> a
-  -> [Tag]
-tags _before (Lockstep after _) action _lookUp result =
-    case (action, result) of
-      (Read _, Right _) -> [ SuccessfulRead ]
-      (Open _, Right _) -> [ OpenTwo
-                           | Set.size (statsOpenedFiles (stateStats after)) > 1
-                           ]
-      _otherwise        -> []
 
 {-------------------------------------------------------------------------------
   Top-level test
@@ -285,8 +281,10 @@ tags _before (Lockstep after _) action _lookUp result =
 
 tests :: TestTree
 tests = testGroup "UsingQD" [
-      testProperty "runActions" $
-        propLockstep (createTempDirectory tmpDir "QSM") runIO
+      testProperty "propLockstep" $
+        Lockstep.runActions (createTempDirectory tmpDir "QSM") runIO
+    , testCase "labelledExamples" $
+        Lockstep.labelledExamples (Proxy @State)
     ]
   where
     -- TODO: tmpDir should really be a parameter to the test suite
