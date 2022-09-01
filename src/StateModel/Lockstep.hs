@@ -17,20 +17,31 @@ module StateModel.Lockstep (
     InLockstep(..)
   , Lockstep(..)
   , LockstepAction
-  , MockEnv
+  , ModelVar
+  , ModelLookUp
+  , ModelFindVariables
     -- * Default implementations for methods of 'StateModel'
   , StateModel.Lockstep.initialState
   , StateModel.Lockstep.nextState
   , StateModel.Lockstep.precondition
   , StateModel.Lockstep.postcondition
+  , StateModel.Lockstep.arbitraryAction
+    -- * Utilities for running the tests
+  , propLockstep
   ) where
 
+import Control.Monad
 import Data.Kind
+import Data.Typeable
 
+import Test.QuickCheck
+import Test.QuickCheck.Monadic
 import Test.QuickCheck.StateModel
 
-import StateModel.Lockstep.EnvOf (EnvOf)
-import StateModel.Lockstep.EnvOf qualified as EnvOf
+import StateModel.Lockstep.EnvF (EnvF)
+import StateModel.Lockstep.EnvF qualified as EnvF
+import StateModel.Lockstep.GVar (GVar, InterpretOp)
+import StateModel.Lockstep.GVar qualified as GVar
 
 {-------------------------------------------------------------------------------
   Lockstep
@@ -38,114 +49,169 @@ import StateModel.Lockstep.EnvOf qualified as EnvOf
 
 data Lockstep state = Lockstep {
       lockstepModel :: state
-    , lockstepEnv   :: MockEnv state
+    , lockstepEnvF  :: EnvF (ModelValue state)
     }
   deriving (Show)
 
-type LockstepAction state = Action (Lockstep state)
-
 class
      ( StateModel (Lockstep state)
+     , Typeable state
+     , InterpretOp (ModelVarOp state) (ModelValue state)
+     , forall a. Show (ModelValue state a)
      , forall a. Eq   (Observable state a)
      , forall a. Show (Observable state a)
      )
   => InLockstep state where
-  -- | Type of errors
+
+  -- | Type of operations required on the results of actions
   --
-  -- These are errors as defined in the model. The real system will need to
-  -- reflect exceptions and other errors as these model errors.
-  type MockError state :: Type
+  -- Whenever an action has a result of type @a@, but we later need a variable
+  -- of type @b@, we need a constructor
+  --
+  -- > GetB :: ModelVarOp state a b
+  --
+  -- in the 'ModelVarOp' type. For many tests, the standard 'Op' type will
+  -- suffice, but not always.
+  type ModelVarOp state :: Type -> Type -> Type
 
   -- | Values in the mock environment
   --
-  -- Consider the type of 'nextState':
+  -- 'ModelValue' witnesses the relation between values returned by the real
+  -- system and values returned by the model.
   --
-  -- > nextState :: state -> Action state a -> Var a -> state
-  --
-  -- Type @a@ will record the type of the system under test; for example, it
-  -- might refer to IO handles. In the model, however, we want to record the
-  -- corresponding /mock/ handles. 'MockValue' witnesses this mapping.
-  data MockValue state a
+  -- In most cases, we expect the real system and the model to return the
+  -- /same/ value. However, for some things we must allow them to diverge:
+  -- consider file handles for example.
+  data ModelValue state a
 
   -- | Observable responses
   --
-  -- We want to verify that the system under test and the model agree, but we
-  -- don't want to insist that they agree on /everything/. For example,
-  -- the real system might return an IO handle, where the model returns a mock
-  -- handle. We should not try to compare these. 'Observable' witnesses the
-  -- relation between actual results and observable results.
+  -- The real system returns values of type @a@, and the model returns values
+  -- of type @MockValue a@. @Observable a@ defines the parts of those results
+  -- that expect to be the /same/ for both.
   data Observable state a
 
   -- | Extract the observable part of a response from the system under test
   --
   -- See also 'Observable'
-  observe ::
-       LockstepAction state a
-    -> a
-    -> Observable state a
+  observeReal :: LockstepAction state a -> a -> Observable state a
 
-  -- | Run an action against the model
-  runModel ::
-        MockEnv state
-     -> LockstepAction state a
-     -> state
-     -> ((Observable state a, Maybe (Var a -> MockEnv state)), state)
+  -- | Extract the observable part of a response from the model
+  observeModel :: ModelValue state a-> Observable state a
 
   -- | All variables required by a command
-  usedVars :: LockstepAction state a -> [Any Var]
+  usedVars :: LockstepAction state a -> [Any (ModelVar state)]
 
-type MockEnv state = EnvOf (MockError state) (MockValue state)
+  -- | Step the model
+  modelNextState ::
+       ModelLookUp state
+    -> LockstepAction state a
+    -> state
+    -> (ModelValue state a, state)
+
+  arbitraryActionWithVars ::
+       ModelFindVariables state
+    -> state
+    -> Gen (Any (LockstepAction state))
+
+-- | An action in the lock-step model
+type LockstepAction state = Action (Lockstep state)
+
+-- | Variables with a "functor-like" instance
+type ModelVar state = GVar (ModelVarOp state)
+
+-- | Look up a variable for model execution
+--
+-- The type of the variable is the type in the /real/ system.
+type ModelLookUp state = forall a.
+          Typeable a
+       => ModelVar state a -> ModelValue state a
+
+-- | Pick variable of the appropriate type
+--
+-- This is used when generation actions. The type you pass must be the result
+-- type of (previously executed) actions.
+--
+-- If you want to @fmap@ (in quotes..) over the type of that variable, see
+-- 'StateModel.Lockstep.GVar.map'.
+type ModelFindVariables state = forall proxy a.
+          Typeable a
+       => proxy a -> Maybe (Gen (GVar (ModelVarOp state) a))
 
 {-------------------------------------------------------------------------------
   Internal auxiliary
 -------------------------------------------------------------------------------}
 
-modelResponse ::
+-- | Think wrapper around 'modelNextState' that constructs the lookup function
+modelNextState' :: forall state a.
      InLockstep state
   => Lockstep state
   -> LockstepAction state a
-  -> Observable state a
-modelResponse (Lockstep state env) action =
-    fst . fst $ runModel env action state
+  -> (ModelValue state a, state)
+modelNextState' (Lockstep state env) action =
+    modelNextState modelLookUp action state
+  where
+    modelLookUp :: ModelLookUp state
+    modelLookUp x =
+        case GVar.lookUpEnvF x env of
+          Left  err -> error err -- Ruled out by the precondition
+          Right val -> val
+
+-- | Thin wrapper around 'monadicIO' that allows a separate initialation step
+--
+-- This is useful when testing stateful code that requires a single setup
+-- call before the tests are run (the initializer will be run for every test,
+-- including for every shrunk test).
+monadicInit :: Testable b => IO a -> (a -> PropertyM IO b) -> Property
+monadicInit initState prop = monadicIO $ run initState >>= prop
 
 {-------------------------------------------------------------------------------
   Default implementations for members of 'StateModel'
 -------------------------------------------------------------------------------}
 
+-- | Default implementation for 'Test.QuickCheck.StateModel.initialState'
 initialState :: state -> Lockstep state
 initialState state = Lockstep {
       lockstepModel = state
-    , lockstepEnv   = EnvOf.empty
+    , lockstepEnvF  = EnvF.empty
     }
 
-nextState :: forall state a.
-     InLockstep state
+-- | Default implementation for 'Test.QuickCheck.StateModel.nextState'
+nextState :: forall state a. (InLockstep state, Typeable a)
   => Lockstep state
   -> LockstepAction state a
   -> Var a
   -> Lockstep state
-nextState (Lockstep state env) action var =
-    case mEnv' of
-      Nothing   -> Lockstep state' $ env
-      Just env' -> Lockstep state' $ env' var
+nextState st@(Lockstep _ env) action var =
+     Lockstep state' (EnvF.insert var modelResp env)
   where
-    mEnv' :: Maybe (Var a -> EnvOf (MockError state) (MockValue state))
-    state'     :: state
-    ((_modelResp, mEnv'), state') = runModel env action state
+    modelResp :: ModelValue state a
+    state'    :: state
+    (modelResp, state') = modelNextState' st action
 
+-- | Default implementation for 'Test.QuickCheck.StateModel.precondition'
+--
+-- The default precondition only checks that all variables have a value
+-- and that the operations on them are defined.
 precondition ::
      InLockstep state
   => Lockstep state -> LockstepAction state a -> Bool
-precondition (Lockstep _ env) =
-    all (EnvOf.member env) . usedVars
+precondition (Lockstep _ env) = all (GVar.definedInEnvF env) . usedVars
 
-postcondition ::
+-- | Default implementation for 'Test.QuickCheck.StateModel.postcondition'
+--
+-- The default postcondition verifies that the real system and the model
+-- return the same results, up to " observability ".
+postcondition :: forall state a.
      InLockstep state
   => Lockstep state -> LockstepAction state a -> LookUp -> a -> Maybe String
-postcondition state action _lookUp a =
-    compareEquality (observe action a) (modelResponse state action)
+postcondition st action _lookUp a =
+    compareEquality (observeReal action a) (observeModel modelResp)
   where
-    compareEquality :: (Eq a, Show a) => a -> a -> Maybe String
+    modelResp :: ModelValue state a
+    modelResp = fst $ modelNextState' st action
+
+    compareEquality ::  Observable state a -> Observable state a -> Maybe String
     compareEquality real mock
       | real == mock = Nothing
       | otherwise    = Just $ concat [
@@ -155,3 +221,32 @@ postcondition state action _lookUp a =
           , show mock
           ]
 
+-- | Default implementation for 'Test.QuickCheck.StateModel.arbitraryAction'
+arbitraryAction :: forall state.
+     InLockstep state
+  => Lockstep state -> Gen (Any (LockstepAction state))
+arbitraryAction (Lockstep state env) =
+    arbitraryActionWithVars findVars state
+  where
+    findVars :: Typeable a => proxy a -> Maybe (Gen (GVar (ModelVarOp state) a))
+    findVars p =
+        case EnvF.keysOfType p env of
+          [] -> Nothing
+          xs -> Just $ elements (map GVar.fromVar xs)
+
+{-------------------------------------------------------------------------------
+  Utilities for running the tests
+-------------------------------------------------------------------------------}
+
+-- | Run the test
+--
+-- This is a thin wrapper around 'runActions' that allows for a separate
+-- state initialization step.
+propLockstep ::
+     StateModel state
+  => IO st
+  -> (st -> RunModel state IO)
+  -> Actions state -> Property
+propLockstep initState runner actions =
+    monadicInit initState $ \st ->
+      void $ runActions (runner st) actions

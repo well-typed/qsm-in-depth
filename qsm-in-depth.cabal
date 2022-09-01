@@ -17,8 +17,8 @@ executable qsm-in-depth
                        Version2
                        UsingQD
                        StateModel.Lockstep
-                       StateModel.Lockstep.EnvOf
-                       StateModel.Util
+                       StateModel.Lockstep.EnvF
+                       StateModel.Lockstep.GVar
                        Mock
   build-depends:       base >=4.10
                      , bifunctors

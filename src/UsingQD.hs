@@ -3,6 +3,7 @@
 {-# LANGUAGE ImportQualifiedPost   #-}
 {-# LANGUAGE InstanceSigs          #-}
 {-# LANGUAGE LambdaCase            #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes            #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE StandaloneDeriving    #-}
@@ -11,11 +12,14 @@
 
 {-# OPTIONS_GHC -Wall -Wno-orphans #-}
 
+-- TODO: Temporary
+{-# OPTIONS_GHC -Wno-unused-imports #-}
+
 module UsingQD (tests) where
 
 import Prelude hiding (init)
 
-import Control.Exception
+import Control.Exception (catch, throwIO)
 import Control.Monad
 import Data.Bifunctor
 import Data.Functor.Const
@@ -32,10 +36,9 @@ import Test.QuickCheck qualified as QC
 import Test.QuickCheck.StateModel
 
 import StateModel.Lockstep
-import StateModel.Lockstep.EnvOf (EnvOf)
-import StateModel.Lockstep.EnvOf qualified as EnvOf
 import StateModel.Lockstep qualified as Lockstep
-import StateModel.Util
+import StateModel.Lockstep.GVar (GVar, Op(..), Operation(..), InterpretOp(..))
+import StateModel.Lockstep.GVar qualified as GVar
 
 import Mock (Mock, Dir(..), File(..), Err)
 import Mock qualified as Mock
@@ -46,22 +49,120 @@ import Mock qualified as Mock
 
 instance StateModel (Lockstep Mock) where
   data Action (Lockstep Mock) a where
-    MkDir :: Dir                     -> Action (Lockstep Mock) (Either Err ())
-    Open  :: File                    -> Action (Lockstep Mock) (Either Err IO.Handle)
-    Write :: Var IO.Handle -> String -> Action (Lockstep Mock) (Either Err ())
-    Close :: Var IO.Handle           -> Action (Lockstep Mock) (Either Err ())
-    Read  :: File                    -> Action (Lockstep Mock) (Either Err String)
+    MkDir :: Dir                                -> Action (Lockstep Mock) (Either Err ())
+    Open  :: File                               -> Action (Lockstep Mock) (Either Err IO.Handle)
+    Write :: ModelVar Mock IO.Handle  -> String -> Action (Lockstep Mock) (Either Err ())
+    Close :: ModelVar Mock IO.Handle            -> Action (Lockstep Mock) (Either Err ())
+    Read  :: File                               -> Action (Lockstep Mock) (Either Err String)
 
-  arbitraryAction (Lockstep _mock env) = QC.oneof [
-        fmap Some $ MkDir <$> genDir
-      , fmap Some $ Open  <$> genFile
-      , fmap Some $ Read  <$> genFile
-      , genHandle `thenGen` \(Const h) -> QC.oneof [
-            fmap Some $ Write h <$> genString
-          , fmap Some $ pure $ Close h
-          ]
+  initialState    = Lockstep.initialState Mock.emptyMock
+  nextState       = Lockstep.nextState
+  precondition    = Lockstep.precondition
+  postcondition   = Lockstep.postcondition
+  arbitraryAction = Lockstep.arbitraryAction
+
+deriving instance Show (Action (Lockstep Mock) a)
+deriving instance Eq   (Action (Lockstep Mock) a)
+
+instance InterpretOp (Op Err) (ModelValue Mock) where
+  interpretOp = go
+    where
+      go :: Op Err a b -> ModelValue Mock a -> Either String (ModelValue Mock b)
+      go OpId         = Right
+      go (OpRight op) = distrib <=< go op
+
+      distrib ::
+           ModelValue Mock (Either Err a)
+        -> Either String (ModelValue Mock a)
+      distrib (ModelErr (Left  err)) = Left (show err)
+      distrib (ModelErr (Right val)) = Right val
+
+instance InLockstep Mock where
+  type ModelVarOp Mock = Op Err
+
+  data ModelValue Mock a where
+    ModelErr :: Either Err (ModelValue Mock a) -> ModelValue Mock (Either Err a)
+
+    -- primitive types
+
+    ModelString :: String       -> ModelValue Mock String
+    ModelUnit   :: ()           -> ModelValue Mock ()
+    ModelHandle :: Mock.MHandle -> ModelValue Mock IO.Handle
+
+  data Observable Mock a where
+    ObserveErr    :: Either Err (Observable Mock a) -> Observable Mock (Either Err a)
+    ObserveId     :: (Show a, Eq a) => a -> Observable Mock a
+    ObserveHandle :: Observable Mock IO.Handle
+
+  observeReal :: LockstepAction Mock a -> a -> Observable Mock a
+  observeReal = \case
+      MkDir{} -> ObserveErr . fmap ObserveId
+      Open{}  -> ObserveErr . fmap (const ObserveHandle)
+      Write{} -> ObserveErr . fmap ObserveId
+      Close{} -> ObserveErr . fmap ObserveId
+      Read{}  -> ObserveErr . fmap ObserveId
+
+  observeModel :: ModelValue Mock a -> Observable Mock a
+  observeModel = \case
+      ModelErr    x -> ObserveErr $ fmap observeModel x
+      ModelString x -> ObserveId x
+      ModelUnit   x -> ObserveId x
+      ModelHandle _ -> ObserveHandle
+
+  usedVars = \case
+      MkDir{}   -> []
+      Open{}    -> []
+      Write h _ -> [Some h]
+      Close h   -> [Some h]
+      Read{}    -> []
+
+  modelNextState ::
+       ModelLookUp Mock
+    -> LockstepAction Mock a
+    -> Mock
+    -> (ModelValue Mock a, Mock)
+  modelNextState lookUp = \case
+      MkDir d   -> first (liftErr ModelUnit)   . Mock.mMkDir d
+      Open  f   -> first (liftErr ModelHandle) . Mock.mOpen f
+      Write h s -> first (liftErr ModelUnit)   . Mock.mWrite (lookUpHandle h) s
+      Close h   -> first (liftErr ModelUnit)   . Mock.mClose (lookUpHandle h)
+      Read f    -> first (liftErr ModelString) . Mock.mRead f
+    where
+      lookUpHandle :: ModelVar Mock IO.Handle -> Mock.MHandle
+      lookUpHandle var =
+          case lookUp var of
+            ModelHandle h -> h
+
+      liftErr ::
+          (a -> ModelValue Mock b)
+        -> Either Err a -> ModelValue Mock (Either Err b)
+      liftErr f = ModelErr . fmap f
+
+  arbitraryActionWithVars findVars _mock = QC.oneof $ concat [
+        withoutVars
+      , case findVars (Proxy @((Either Err IO.Handle))) of
+          Nothing     -> []
+          Just genVar -> withVars genVar
       ]
     where
+      withoutVars :: [Gen (Any (LockstepAction Mock))]
+      withoutVars = [
+            fmap Some $ MkDir <$> genDir
+          , fmap Some $ Open  <$> genFile
+          , fmap Some $ Read  <$> genFile
+          ]
+
+      withVars ::
+           Gen (GVar (Op Err) (Either Err IO.Handle))
+        -> [Gen (Any (LockstepAction Mock))]
+      withVars genVar = [
+            fmap Some $ Write <$> genVar' <*> genString
+          , fmap Some $ Close <$> genVar'
+          ]
+        where
+          genVar' :: Gen (GVar (Op Err) IO.Handle)
+          genVar' = GVar.map OpRight <$> genVar
+
       genDir :: Gen Dir
       genDir = do
           n <- QC.choose (0, 3)
@@ -73,79 +174,10 @@ instance StateModel (Lockstep Mock) where
       genString :: Gen String
       genString = QC.sized $ \n -> replicateM n (QC.elements "ABC")
 
-      genHandle :: Gen (Any (Const (Var IO.Handle)))
-      genHandle = elementsOrFail $ EnvOf.keysOfType (Proxy @IO.Handle) env
-
-  initialState  = Lockstep.initialState Mock.emptyMock
-  nextState     = Lockstep.nextState
-  precondition  = Lockstep.precondition
-  postcondition = Lockstep.postcondition
-
-deriving instance Show (Action (Lockstep Mock) a)
-deriving instance Eq   (Action (Lockstep Mock) a)
-
-instance InLockstep Mock where
-  type MockError Mock = Mock.Err
-
-  data Observable Mock a where
-    ObserveUnit   :: Either Err ()     -> Observable Mock (Either Err ())
-    ObserveHandle :: Either Err ()     -> Observable Mock (Either Err IO.Handle)
-    ObserveString :: Either Err String -> Observable Mock (Either Err String)
-
-  data MockValue Mock a where
-    MockHandle :: Mock.MHandle -> MockValue Mock IO.Handle
-
-  observe ::
-       LockstepAction Mock a
-    -> a
-    -> Observable Mock a
-  observe = \case
-      MkDir{} -> ObserveUnit
-      Open{}  -> ObserveHandle . fmap (const ())
-      Write{} -> ObserveUnit
-      Close{} -> ObserveUnit
-      Read{}  -> ObserveString
-
-  runModel ::
-        MockEnv Mock
-     -> LockstepAction Mock a
-     -> Mock
-     -> ((Observable Mock a, Maybe (Var a -> MockEnv Mock)), Mock)
-  runModel env = \case
-      MkDir d   -> first (ObserveUnit          &&& const Nothing)     . Mock.mMkDir d
-      Open  f   -> first (ObserveHandle . hide &&& extend MockHandle) . Mock.mOpen f
-      Write h s -> first (ObserveUnit          &&& const Nothing)     . Mock.mWrite (lookUpHandle h) s
-      Close h   -> first (ObserveUnit          &&& const Nothing)     . Mock.mClose (lookUpHandle h)
-      Read f    -> first (ObserveString        &&& const Nothing)     . Mock.mRead f
-    where
-      hide :: Either Err a -> Either Err ()
-      hide = fmap (const ())
-
-      extend ::
-           Typeable real
-        => (mock -> MockValue Mock real)
-        -> Either Err mock
-        -> Maybe (Var (Either Err real) -> EnvOf Err (MockValue Mock))
-      extend wrapMock = either (const Nothing) $ \val ->
-          Just $ \var -> EnvOf.insert var (wrapMock val) env
-
-      lookUpHandle :: Var IO.Handle -> Mock.MHandle
-      lookUpHandle var =
-          case EnvOf.lookup var env of
-            Just (MockHandle h) -> h
-            Nothing -> error "this should be impossible due to preconditions"
-
-  usedVars = \case
-      MkDir{}   -> []
-      Open{}    -> []
-      Write h _ -> [Some h]
-      Close h   -> [Some h]
-      Read{}    -> []
-
-deriving instance Show (MockValue Mock a)
-
 deriving instance Show (Observable Mock a)
 deriving instance Eq   (Observable Mock a)
+
+deriving instance Show (ModelValue Mock a)
 
 {-------------------------------------------------------------------------------
   Interpreter for IO
@@ -172,12 +204,8 @@ runIO root = RunModel go
           Read f -> catchErr $
             IO.readFile (Mock.fileFP root f)
       where
-        lookUp' :: Var IO.Handle -> IO.Handle
-        lookUp' (Var x) =
-            either (error "impossible") id $ lookUp var'
-          where
-            var' :: Var (Either Err IO.Handle)
-            var' = Var x
+        lookUp' :: ModelVar Mock IO.Handle -> IO.Handle
+        lookUp' = either (error "impossible") id . GVar.lookUpEnv lookUp
 
 catchErr :: forall a. IO a -> IO (Either Err a)
 catchErr act = catch (Right <$> act) handler
@@ -191,9 +219,8 @@ catchErr act = catch (Right <$> act) handler
 
 tests :: TestTree
 tests = testGroup "UsingQD" [
-      testProperty "runActions" $ \actions ->
-        monadicInit (createTempDirectory tmpDir "QSM") $ \root ->
-          void $ runActions (runIO root) actions
+      testProperty "runActions" $
+        propLockstep (createTempDirectory tmpDir "QSM") runIO
     ]
   where
     -- TODO: tmpDir should really be a parameter to the test suite
