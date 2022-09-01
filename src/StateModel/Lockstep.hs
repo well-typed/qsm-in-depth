@@ -261,11 +261,15 @@ monitoring :: forall state a.
   -> LookUp
   -> a
   -> Property -> Property
-monitoring (st@(Lockstep before _), Lockstep after _) action _lookUp _realResp =
-    tabulate "Tags" $ tagStep (before, after) action modelResp
+monitoring (before, after) action _lookUp _realResp =
+      counterexample ("State: " ++ show after)
+    . tabulate "Tags" tags
   where
+    tags :: [String]
+    tags = tagStep (lockstepModel before, lockstepModel after) action modelResp
+
     modelResp :: ModelValue state a
-    modelResp = fst $ stepModelState st action
+    modelResp = fst $ stepModelState before action
 
 {-------------------------------------------------------------------------------
   Finding labelled examples
