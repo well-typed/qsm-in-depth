@@ -8,18 +8,19 @@
 {-# LANGUAGE RecordWildCards       #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE StandaloneDeriving    #-}
+{-# LANGUAGE TupleSections         #-}
 {-# LANGUAGE TypeApplications      #-}
 {-# LANGUAGE TypeFamilies          #-}
+
+{-# OPTIONS_GHC -Wall -Wredundant-constraints #-}
 
 module UsingQD (tests) where
 
 import Prelude hiding (init)
 
-import Control.Arrow ((&&&))
 import Control.Exception (catch, throwIO)
 import Control.Monad
 import Data.Bifunctor
-import Data.Functor.Const
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Typeable
@@ -30,13 +31,13 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
 import Test.Tasty.QuickCheck (testProperty)
 
-import Test.QuickCheck (Property, Gen)
+import Test.QuickCheck (Gen)
 import Test.QuickCheck qualified as QC
 import Test.QuickCheck.StateModel
 
 import StateModel.Lockstep
 import StateModel.Lockstep qualified as Lockstep
-import StateModel.Lockstep.GVar (GVar, Op(..), Operation(..), InterpretOp(..))
+import StateModel.Lockstep.GVar (GVar, AnyGVar(..), Op(..), InterpretOp(..))
 import StateModel.Lockstep.GVar qualified as GVar
 
 import Mock (Mock, Dir(..), File(..), Err)
@@ -61,88 +62,87 @@ initState = State {
 instance StateModel (Lockstep State) where
   data Action (Lockstep State) a where
     MkDir :: Dir                                 -> Action (Lockstep State) (Either Err ())
-    Open  :: File                                -> Action (Lockstep State) (Either Err IO.Handle)
+    Open  :: File                                -> Action (Lockstep State) (Either Err (IO.Handle, File))
     Write :: ModelVar State IO.Handle  -> String -> Action (Lockstep State) (Either Err ())
     Close :: ModelVar State IO.Handle            -> Action (Lockstep State) (Either Err ())
-    Read  :: File                                -> Action (Lockstep State) (Either Err String)
+    Read  :: Either (ModelVar State File) File   -> Action (Lockstep State) (Either Err String)
 
   initialState    = Lockstep.initialState initState
   nextState       = Lockstep.nextState
   precondition    = Lockstep.precondition
   postcondition   = Lockstep.postcondition
   arbitraryAction = Lockstep.arbitraryAction
+  shrinkAction    = Lockstep.shrinkAction
   monitoring      = Lockstep.monitoring
-
-  shrinkAction ::
-       (Show a, Typeable a)
-    => Lockstep State
-    -> LockstepAction State a
-    -> [Any (LockstepAction State)]
-  shrinkAction _ = \case
-      Open (File (Dir []) ('t' : n)) ->
-        [openTemp n' | n' <- QC.shrink (read n)]
-      Open _ ->
-        [openTemp 100]
-      _otherwise ->
-        []
-    where
-      openTemp :: Int -> Any (LockstepAction State)
-      openTemp n = Some $ Open (File (Dir []) ('t' : show n))
 
 deriving instance Show (Action (Lockstep State) a)
 deriving instance Eq   (Action (Lockstep State) a)
 
-instance InterpretOp (Op Err) (ModelValue State) where
-  interpretOp = go
-    where
-      go :: Op Err a b -> ModelValue State a -> Either String (ModelValue State b)
-      go OpId         = Right
-      go (OpRight op) = distrib <=< go op
-
-      distrib ::
-           ModelValue State (Either Err a)
-        -> Either String (ModelValue State a)
-      distrib (ModelErr (Left  err)) = Left (show err)
-      distrib (ModelErr (Right val)) = Right val
+instance InterpretOp Op (ModelValue State) where
+  intOp OpId         = Right
+  intOp OpFst        = \case MPair   x -> Right (fst x)
+  intOp OpSnd        = \case MPair   x -> Right (snd x)
+  intOp OpLeft       = \case MEither x -> either Right (const $ Left "Not Left") x
+  intOp OpRight      = \case MEither x -> bimap show id x
+  intOp (OpComp g f) = intOp g <=< intOp f
 
 instance InLockstep State where
-  type ModelVarOp State = Op Err
+  type ModelOp State = Op
 
+  data Observable State a where
+    OEither :: Either (Observable State a) (Observable State b) -> Observable State (Either a b)
+    OPair   :: (Observable State a, Observable State b) -> Observable State (a, b)
+    OId     :: (Show a, Typeable a, Eq a) => a -> Observable State a
+    OHandle :: Observable State IO.Handle
+
+  -- | Model values
+  --
+  -- For model values, we must be sure that if we have a value of type
+  --
+  -- > ModelValue State IO.Handle
+  --
+  -- that it is a in fact mock handle. This means that here we cannot define
+  --
+  -- > ModelId :: a -> ModelValue State a
+  --
+  -- unlike in @Observable State@.
   data ModelValue State a where
-    ModelErr :: Either Err (ModelValue State a) -> ModelValue State (Either Err a)
+    MEither :: Either (ModelValue State a) (ModelValue State b) -> ModelValue State (Either a b)
+    MPair   :: (ModelValue State a, ModelValue State b) -> ModelValue State (a, b)
 
     -- primitive types
 
-    ModelString :: String       -> ModelValue State String
-    ModelUnit   :: ()           -> ModelValue State ()
-    ModelHandle :: Mock.MHandle -> ModelValue State IO.Handle
-
-  data Observable State a where
-    ObserveErr    :: Either Err (Observable State a) -> Observable State (Either Err a)
-    ObserveId     :: (Show a, Eq a) => a -> Observable State a
-    ObserveHandle :: Observable State IO.Handle
+    MErr    :: Err          -> ModelValue State Err
+    MFile   :: File         -> ModelValue State File
+    MString :: String       -> ModelValue State String
+    MUnit   :: ()           -> ModelValue State ()
+    MHandle :: Mock.MHandle -> ModelValue State IO.Handle
 
   observeReal :: LockstepAction State a -> a -> Observable State a
   observeReal = \case
-      MkDir{} -> ObserveErr . fmap ObserveId
-      Open{}  -> ObserveErr . fmap (const ObserveHandle)
-      Write{} -> ObserveErr . fmap ObserveId
-      Close{} -> ObserveErr . fmap ObserveId
-      Read{}  -> ObserveErr . fmap ObserveId
+      MkDir{} -> OEither . bimap OId OId
+      Open{}  -> OEither . bimap OId (OPair . bimap (const OHandle) OId)
+      Write{} -> OEither . bimap OId OId
+      Close{} -> OEither . bimap OId OId
+      Read{}  -> OEither . bimap OId OId
 
   observeModel :: ModelValue State a -> Observable State a
   observeModel = \case
-      ModelErr    x -> ObserveErr $ fmap observeModel x
-      ModelString x -> ObserveId x
-      ModelUnit   x -> ObserveId x
-      ModelHandle _ -> ObserveHandle
+      MEither x -> OEither $ bimap observeModel observeModel x
+      MPair   x -> OPair   $ bimap observeModel observeModel x
+      MErr    x -> OId x
+      MString x -> OId x
+      MUnit   x -> OId x
+      MFile   x -> OId x
+      MHandle _ -> OHandle
 
   usedVars = \case
-      MkDir{}   -> []
-      Open{}    -> []
-      Write h _ -> [Some h]
-      Close h   -> [Some h]
-      Read{}    -> []
+      MkDir{}        -> []
+      Open{}         -> []
+      Write h _      -> [SomeGVar h]
+      Close h        -> [SomeGVar h]
+      Read (Left h)  -> [SomeGVar h]
+      Read (Right _) -> []
 
   modelNextState ::
        ModelLookUp State
@@ -155,21 +155,25 @@ instance InLockstep State where
     where
       go :: Action (Lockstep State) a -> Mock -> (ModelValue State a, Mock)
       go = \case
-          MkDir d   -> first (liftErr ModelUnit)   . Mock.mMkDir d
-          Open  f   -> first (liftErr ModelHandle) . Mock.mOpen f
-          Write h s -> first (liftErr ModelUnit)   . Mock.mWrite (lookUpHandle h) s
-          Close h   -> first (liftErr ModelUnit)   . Mock.mClose (lookUpHandle h)
-          Read f    -> first (liftErr ModelString) . Mock.mRead f
+          MkDir d   -> first (liftErr MUnit)     . Mock.mMkDir d
+          Open f    -> first (liftErr (modelOpen f)) . Mock.mOpen f
+          Write h s -> first (liftErr MUnit)     . Mock.mWrite (lookUpHandle h) s
+          Close h   -> first (liftErr MUnit)     . Mock.mClose (lookUpHandle h)
+          Read f    -> first (liftErr MString)   . Mock.mRead (either lookUpFile id f)
+
+      modelOpen :: File -> Mock.MHandle -> ModelValue State (IO.Handle, File)
+      modelOpen f h = MPair (MHandle h, MFile f)
 
       lookUpHandle :: ModelVar State IO.Handle -> Mock.MHandle
-      lookUpHandle var =
-          case lookUp var of
-            ModelHandle h -> h
+      lookUpHandle var = case lookUp var of MHandle h -> h
+
+      lookUpFile :: ModelVar State File -> File
+      lookUpFile var = case lookUp var of MFile f -> f
 
       liftErr ::
-          (a -> ModelValue State b)
+           (a -> ModelValue State b)
         -> Either Err a -> ModelValue State (Either Err b)
-      liftErr f = ModelErr . fmap f
+      liftErr f = MEither . bimap MErr f
 
   arbitraryActionWithVars ::
        ModelFindVariables State
@@ -177,28 +181,29 @@ instance InLockstep State where
     -> Gen (Any (LockstepAction State))
   arbitraryActionWithVars findVars _mock = QC.oneof $ concat [
         withoutVars
-      , case findVars (Proxy @((Either Err IO.Handle))) of
-          Nothing     -> []
-          Just genVar -> withVars genVar
+      , case findVars (Proxy @((Either Err (IO.Handle, File)))) of
+          []   -> []
+          vars -> withVars (QC.elements vars)
       ]
     where
       withoutVars :: [Gen (Any (LockstepAction State))]
       withoutVars = [
             fmap Some $ MkDir <$> genDir
           , fmap Some $ Open  <$> genFile
-          , fmap Some $ Read  <$> genFile
+          , fmap Some $ Read  <$> (Right <$> genFile)
           ]
 
       withVars ::
-           Gen (GVar (Op Err) (Either Err IO.Handle))
+           Gen (GVar (ModelOp State) (Either Err (IO.Handle, File)))
         -> [Gen (Any (LockstepAction State))]
       withVars genVar = [
-            fmap Some $ Write <$> genVar' <*> genString
-          , fmap Some $ Close <$> genVar'
+            fmap Some $ Write <$> genVarHandle <*> genString
+          , fmap Some $ Close <$> genVarHandle
           ]
         where
-          genVar' :: Gen (GVar (Op Err) IO.Handle)
-          genVar' = GVar.map OpRight <$> genVar
+          genVarHandle :: Gen (GVar (ModelOp State) IO.Handle)
+          genVarHandle =
+              GVar.map (\op -> OpFst `OpComp` OpRight `OpComp` op) <$> genVar
 
       genDir :: Gen Dir
       genDir = do
@@ -211,17 +216,36 @@ instance InLockstep State where
       genString :: Gen String
       genString = QC.sized $ \n -> replicateM n (QC.elements "ABC")
 
+  shrinkActionWithVars ::
+       ModelFindVariables State
+    -> State
+    -> LockstepAction State a
+    -> [Any (LockstepAction State)]
+  shrinkActionWithVars findVars _state = \case
+      Open (File (Dir []) ('t' : n)) ->
+        [openTemp n' | n' <- QC.shrink (read n)]
+      Open _ ->
+        [openTemp 100]
+      Read (Right _) ->
+        [ Some $ Read (Left $ GVar.map (\op -> OpSnd `OpComp` OpRight `OpComp` op) v)
+        | v <- findVars (Proxy @((Either Err (IO.Handle, File))))
+        ]
+      _otherwise ->
+        []
+    where
+      openTemp :: Int -> Any (LockstepAction State)
+      openTemp n = Some $ Open (File (Dir []) ('t' : show n))
+
   tagStep ::
-       Show a
-    => (State, State)
+       (State, State)
     -> LockstepAction State a
     -> ModelValue State a
     -> [String]
-  tagStep (before, after) action result = map (show :: Tag -> String) $
+  tagStep (_before, after) action result = map (show :: Tag -> String) $
       case (action, result) of
-        (Read _, ModelErr (Right _)) ->
+        (Read _, MEither (Right _)) ->
           [SuccessfulRead]
-        (Open _, ModelErr (Right _)) ->
+        (Open _, MEither (Right _)) ->
           [ OpenTwo
           | Set.size (statsOpenedFiles (stateStats after)) > 1
           ]
@@ -249,15 +273,15 @@ runIO root = RunModel go
           MkDir d -> catchErr $
             IO.createDirectory (Mock.dirFP root d)
           Open f -> catchErr $
-            IO.openFile (Mock.fileFP root f) IO.AppendMode
+            (,f) <$> IO.openFile (Mock.fileFP root f) IO.AppendMode
           Write h s -> catchErr $
             IO.hPutStr (lookUp' h) s
           Close h -> catchErr $
             IO.hClose (lookUp' h)
           Read f -> catchErr $
-            IO.readFile (Mock.fileFP root f)
+            IO.readFile (Mock.fileFP root $ either lookUp' id f)
       where
-        lookUp' :: ModelVar State IO.Handle -> IO.Handle
+        lookUp' :: (Show x, Typeable x, Eq x) => ModelVar State x -> x
         lookUp' = either (error "impossible") id . GVar.lookUpEnv lookUp
 
 catchErr :: forall a. IO a -> IO (Either Err a)
@@ -283,7 +307,7 @@ initStats = Stats {
 updateStats :: LockstepAction State a -> ModelValue State a -> Stats -> Stats
 updateStats action result stats@Stats{..} =
    case (action, result) of
-     (Open f, ModelErr (Right _)) ->
+     (Open f, MEither (Right _)) ->
        stats { statsOpenedFiles = Set.insert f statsOpenedFiles }
      _otherwise ->
        stats

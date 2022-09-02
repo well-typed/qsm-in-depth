@@ -11,7 +11,7 @@
 {-# LANGUAGE TypeApplications      #-}
 {-# LANGUAGE UndecidableInstances  #-}
 
-{-# OPTIONS_GHC -Wall #-}
+{-# OPTIONS_GHC -Wall -Wredundant-constraints #-}
 
 -- | Generalized variables
 --
@@ -19,10 +19,11 @@
 --
 -- Intended for qualified import.
 --
--- > import StateModel.Lockstep.GVar (GVar, Operation(..), InterpretOp(..))
+-- > import StateModel.Lockstep.GVar (GVar, AnyGVar(..), InterpretOp(..))
 -- > import StateModel.Lockstep.GVar qualified as GVar
 module StateModel.Lockstep.GVar (
     GVar -- opaque
+  , AnyGVar(..)
     -- * Operations
   , Operation(..)
   , InterpretOp(..)
@@ -40,13 +41,12 @@ module StateModel.Lockstep.GVar (
 import Prelude hiding (map)
 
 import Control.Monad
-import Data.Bifunctor
 import Data.Either (isRight)
 import Data.Functor.Identity
 import Data.Kind
 import Data.Typeable
 
-import Test.QuickCheck.StateModel (Var(..), LookUp, Any(..))
+import Test.QuickCheck.StateModel (Var(..), LookUp)
 
 import StateModel.Lockstep.EnvF (EnvF)
 import StateModel.Lockstep.EnvF qualified as EnvF
@@ -56,7 +56,10 @@ import StateModel.Lockstep.EnvF qualified as EnvF
 -------------------------------------------------------------------------------}
 
 data GVar :: (Type -> Type -> Type) -> Type -> Type where
-  GVar :: Typeable x => Var x -> op x y -> GVar op y
+  GVar :: (Show x, Typeable x, Eq x) => Var x -> op x y -> GVar op y
+
+data AnyGVar op where
+  SomeGVar :: (Show y, Typeable y, Eq y) => GVar op y -> AnyGVar op
 
 deriving instance (forall x. Show (op x a)) => Show (GVar op a)
 
@@ -85,37 +88,80 @@ class Operation (op :: Type -> Type -> Type) where
   opIdentity  :: op a a
 
 class Operation op => InterpretOp op (f :: Type -> Type) where
-  interpretOp :: op a b -> f a -> Either String (f b)
+  intOp ::
+       (Show a, Show b, Typeable a, Typeable b, Eq a, Eq b)
+    => op a b -> f a -> Either String (f b)
 
 {-------------------------------------------------------------------------------
-  Example (but useful) 'Operation' example
+  Example (but very useful) 'Operation' example
 
-  NOTE: We do not give a general "composition" constructor as this would make
-  it more difficult to give a meaningful Eq instance.
+  Because this is designed for testing where we want everything to be 'Show'able
+  and 'Typeable', matching on 'Op' might reveal some additonal constrants.
+  This is useful in 'OpComp' where we have an existential variable (@b@), but
+  it's also useful for example in 'OpRight': the caller might have a constraint
+  @Show (Either a b)@, but that doesn't give them a way to obtain a constraint
+  @Show a@; the implication only goes one way.
+
+  (These are the same constraints that 'Any' imposes.)
 -------------------------------------------------------------------------------}
 
-data Op e a b where
-  OpId    :: Op e a a
-  OpRight :: Op e a (Either e c) -> Op e a c
+data Op a b where
+  OpId    :: Op a a
+  OpFst   :: (Show b, Typeable b, Eq b) => Op (a, b) a
+  OpSnd   :: (Show b, Typeable b, Eq b) => Op (b, a) a
+  OpLeft  :: (Show b, Typeable b, Eq b) => Op (Either a b) a
+  OpRight :: (Show b, Typeable b, Eq b) => Op (Either b a) a
+  OpComp  :: (Show b, Typeable b, Eq b) => Op b c -> Op a b -> Op a c
 
-deriving instance Show (Op e a b)
-deriving instance Eq   (Op e a b)
+instance Eq (Op a b) where
+  op == op' =
+      case (op, op') of
+        (OpId       , OpId        ) -> True
+        (OpFst      , OpFst       ) -> True
+        (OpSnd      , OpSnd       ) -> True
+        (OpLeft     , OpLeft      ) -> True
+        (OpRight    , OpRight     ) -> True
+        (OpComp g f , OpComp g' f') -> auxComp (g, f) (g', f')
+        _otherwise                  -> False
+    where
+      auxComp :: forall x y1 y2 z.
+           (Typeable y1, Typeable y2)
+        => (Op y1 z, Op x y1) -> (Op y2 z, Op x y2) -> Bool
+      auxComp (g, f) (g', f') =
+          case eqT @y1 @y2 of
+            Nothing   -> False
+            Just Refl -> (g, f) == (g', f')
 
-instance Operation (Op e) where
+      _coveredAllCases :: Op a b -> ()
+      _coveredAllCases = \case
+          OpId     -> ()
+          OpFst    -> ()
+          OpSnd    -> ()
+          OpLeft   -> ()
+          OpRight  -> ()
+          OpComp{} -> ()
+
+deriving instance Show (Op a b)
+
+instance Operation (Op) where
   opIdentity = OpId
 
-instance Show e => InterpretOp (Op e) Identity where
-  interpretOp = \op -> fmap Identity . go op . runIdentity
+instance InterpretOp (Op) Identity where
+  intOp = \op -> fmap Identity . go op . runIdentity
     where
-      go :: Op e a b -> a -> Either String b
+      go :: Op a b -> a -> Either String b
       go OpId         = Right
-      go (OpRight op) = first show <=< go op
+      go OpFst        = Right . fst
+      go OpSnd        = Right . snd
+      go OpLeft       = either Right (const $ Left "Not Left")
+      go OpRight      = either (const $ Left "Not Right") Right
+      go (OpComp g f) = go g <=< go f
 
 {-------------------------------------------------------------------------------
   Construction
 -------------------------------------------------------------------------------}
 
-fromVar :: Operation op => Typeable a => Var a -> GVar op a
+fromVar :: (Operation op, Show a, Typeable a, Eq a) => Var a -> GVar op a
 fromVar var = GVar var opIdentity
 
 map :: (forall x. op x a -> op x b) -> GVar op a -> GVar op b
@@ -125,20 +171,21 @@ map f (GVar var op) = GVar var (f op)
   Interaction with 'Env' and 'EnvF'
 -------------------------------------------------------------------------------}
 
-lookUpEnv :: InterpretOp op Identity => LookUp -> GVar op a -> Either String a
+lookUpEnv ::
+     (InterpretOp op Identity, Show a, Typeable a, Eq a)
+  => LookUp -> GVar op a -> Either String a
 lookUpEnv lookUp (GVar var op) =
-    fmap runIdentity $ interpretOp op (Identity (lookUp var))
+    fmap runIdentity $ intOp op (Identity (lookUp var))
 
 lookUpEnvF ::
-      (Typeable f, InterpretOp op f)
+      (Typeable f, Typeable a, Show a, Eq a, InterpretOp op f)
    => GVar op a -> EnvF f -> Either String (f a)
 lookUpEnvF (GVar var op) env =
     case EnvF.lookup var env of
       Nothing  -> Left $ "Variable " ++ show var ++ " not in the environment"
-      Just val -> interpretOp op val
+      Just val -> intOp op val
 
-definedInEnvF ::
+definedInEnvF :: forall op f.
      (Typeable f, InterpretOp op f)
-  => EnvF f -> Any (GVar op) -> Bool
-definedInEnvF _    (Error _)  = False
-definedInEnvF envF (Some var) = isRight $ lookUpEnvF var envF
+  => EnvF f -> AnyGVar op -> Bool
+definedInEnvF env (SomeGVar var) = isRight (lookUpEnvF var env)

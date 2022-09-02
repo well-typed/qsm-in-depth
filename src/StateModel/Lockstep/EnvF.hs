@@ -2,7 +2,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving  #-}
 
-{-# OPTIONS_GHC -Wall #-}
+{-# OPTIONS_GHC -Wall -Wredundant-constraints #-}
 
 -- | Environment parameterised by functor @f@
 --

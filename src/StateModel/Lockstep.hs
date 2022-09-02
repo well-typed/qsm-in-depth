@@ -5,7 +5,7 @@
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE TypeFamilies          #-}
 
-{-# OPTIONS_GHC -Wall #-}
+{-# OPTIONS_GHC -Wall -Wredundant-constraints #-}
 
 -- | Lockstep-style testing using @quickcheck-dynamic@
 --
@@ -26,15 +26,19 @@ module StateModel.Lockstep (
   , StateModel.Lockstep.precondition
   , StateModel.Lockstep.postcondition
   , StateModel.Lockstep.arbitraryAction
+  , StateModel.Lockstep.shrinkAction
   , StateModel.Lockstep.monitoring
     -- * Utilities for running the tests
+  , tagActions
   , StateModel.Lockstep.runActions
   , StateModel.Lockstep.labelledExamples
   ) where
 
 import Control.Monad
 import Data.Kind
+import Data.Set (Set)
 import Data.Typeable
+import qualified Data.Set as Set
 
 import Test.QuickCheck
 import Test.QuickCheck.Monadic
@@ -42,10 +46,8 @@ import Test.QuickCheck.StateModel
 
 import StateModel.Lockstep.EnvF (EnvF)
 import StateModel.Lockstep.EnvF qualified as EnvF
-import StateModel.Lockstep.GVar (GVar, InterpretOp)
+import StateModel.Lockstep.GVar (GVar, AnyGVar, InterpretOp)
 import StateModel.Lockstep.GVar qualified as GVar
-import Data.Set (Set)
-import qualified Data.Set as Set
 
 {-------------------------------------------------------------------------------
   Lockstep
@@ -60,7 +62,7 @@ data Lockstep state = Lockstep {
 class
      ( StateModel (Lockstep state)
      , Typeable state
-     , InterpretOp (ModelVarOp state) (ModelValue state)
+     , InterpretOp (ModelOp state) (ModelValue state)
      , forall a. Show (ModelValue state a)
      , forall a. Eq   (Observable state a)
      , forall a. Show (Observable state a)
@@ -72,11 +74,11 @@ class
   -- Whenever an action has a result of type @a@, but we later need a variable
   -- of type @b@, we need a constructor
   --
-  -- > GetB :: ModelVarOp state a b
+  -- > GetB :: ModelOp state a b
   --
-  -- in the 'ModelVarOp' type. For many tests, the standard 'Op' type will
+  -- in the 'ModelOp' type. For many tests, the standard 'Op' type will
   -- suffice, but not always.
-  type ModelVarOp state :: Type -> Type -> Type
+  type ModelOp state :: Type -> Type -> Type
 
   -- | Values in the mock environment
   --
@@ -104,7 +106,7 @@ class
   observeModel :: ModelValue state a-> Observable state a
 
   -- | All variables required by a command
-  usedVars :: LockstepAction state a -> [Any (ModelVar state)]
+  usedVars :: LockstepAction state a -> [AnyGVar (ModelOp state)]
 
   -- | Step the model
   modelNextState ::
@@ -118,6 +120,12 @@ class
     -> state
     -> Gen (Any (LockstepAction state))
 
+  shrinkActionWithVars ::
+       ModelFindVariables state
+    -> state
+    -> LockstepAction state a
+    -> [Any (LockstepAction state)]
+
   tagStep ::
        Show a
     => (state, state)
@@ -129,25 +137,23 @@ class
 type LockstepAction state = Action (Lockstep state)
 
 -- | Variables with a "functor-like" instance
-type ModelVar state = GVar (ModelVarOp state)
+type ModelVar state = GVar (ModelOp state)
 
 -- | Look up a variable for model execution
 --
 -- The type of the variable is the type in the /real/ system.
 type ModelLookUp state = forall a.
-          Typeable a
+          (Show a, Typeable a, Eq a)
        => ModelVar state a -> ModelValue state a
 
 -- | Pick variable of the appropriate type
 --
--- This is used when generation actions. The type you pass must be the result
--- type of (previously executed) actions.
---
--- If you want to @fmap@ (in quotes..) over the type of that variable, see
+-- The type you pass must be the result type of (previously executed) actions.
+-- If you want to change the type of the variable, see
 -- 'StateModel.Lockstep.GVar.map'.
 type ModelFindVariables state = forall proxy a.
-          Typeable a
-       => proxy a -> Maybe (Gen (GVar (ModelVarOp state) a))
+          (Show a, Typeable a, Eq a)
+       => proxy a -> [GVar (ModelOp state) a]
 
 {-------------------------------------------------------------------------------
   Internal auxiliary
@@ -181,6 +187,11 @@ stepLockstepState st@(Lockstep _ env) action var =
     modelResp :: ModelValue state a
     state'    :: state
     (modelResp, state') = stepModelState st action
+
+modelFindVariables ::
+     InLockstep state
+  => EnvF (ModelValue state) -> ModelFindVariables state
+modelFindVariables env p = map GVar.fromVar $ EnvF.keysOfType p env
 
 -- | Thin wrapper around 'monadicIO' that allows a separate initialation step
 --
@@ -242,17 +253,18 @@ postcondition st action _lookUp a =
           ]
 
 -- | Default implementation for 'Test.QuickCheck.StateModel.arbitraryAction'
-arbitraryAction :: forall state.
+arbitraryAction ::
      InLockstep state
   => Lockstep state -> Gen (Any (LockstepAction state))
 arbitraryAction (Lockstep state env) =
-    arbitraryActionWithVars findVars state
-  where
-    findVars :: Typeable a => proxy a -> Maybe (Gen (GVar (ModelVarOp state) a))
-    findVars p =
-        case EnvF.keysOfType p env of
-          [] -> Nothing
-          xs -> Just $ elements (map GVar.fromVar xs)
+    arbitraryActionWithVars (modelFindVariables env) state
+
+shrinkAction ::
+     InLockstep state
+  => Lockstep state
+  -> LockstepAction state a -> [Any (LockstepAction state)]
+shrinkAction (Lockstep state env) =
+    shrinkActionWithVars (modelFindVariables env) state
 
 monitoring :: forall state a.
      (InLockstep state, Show a)
