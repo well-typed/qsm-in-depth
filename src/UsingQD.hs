@@ -182,8 +182,8 @@ instance InLockstep FsState where
   -- Generation, shrinking and labelling
   --
 
-  arbitraryActionWithVars findVars _mock = arbitraryFsAction findVars
-  shrinkActionWithVars    findVars _mock = shrinkFsAction    findVars
+  arbitraryWithVars findVars _mock = arbitraryFsAction findVars
+  shrinkWithVars    findVars _mock = shrinkFsAction    findVars
 
   tagStep (_, FsState _ after) act = map show . tagFsAction after act
 
@@ -203,9 +203,9 @@ runMock ::
 runMock lookUp = \case
     MkDir d   -> wrap MUnit     . Mock.mMkDir d
     Open f    -> wrap (mOpen f) . Mock.mOpen f
-    Write h s -> wrap MUnit     . Mock.mWrite (lookUpHandle h) s
-    Close h   -> wrap MUnit     . Mock.mClose (lookUpHandle h)
-    Read f    -> wrap MString   . Mock.mRead (either lookUpFile id f)
+    Write h s -> wrap MUnit     . Mock.mWrite (getHandle $ lookUp h) s
+    Close h   -> wrap MUnit     . Mock.mClose (getHandle $ lookUp h)
+    Read f    -> wrap MString   . Mock.mRead (either (getFile . lookUp) id f)
   where
     wrap :: (a -> FsVal b) -> (Either Err a, Mock) -> (FsVal (Either Err b), Mock)
     wrap f = first (MEither . bimap MErr f)
@@ -213,11 +213,11 @@ runMock lookUp = \case
     mOpen :: File -> Mock.MHandle -> FsVal (IO.Handle, File)
     mOpen f h = MPair (MHandle h, MFile f)
 
-    lookUpHandle :: FsVar IO.Handle -> Mock.MHandle
-    lookUpFile   :: FsVar File      -> File
+    getHandle :: ModelValue FsState IO.Handle -> Mock.MHandle
+    getFile   :: ModelValue FsState File      -> File
 
-    lookUpHandle var = case lookUp var of MHandle h -> h
-    lookUpFile   var = case lookUp var of MFile   f -> f
+    getHandle (MHandle h) = h
+    getFile   (MFile   f) = f
 
 {-------------------------------------------------------------------------------
   Generator and shrinking
@@ -349,7 +349,7 @@ data Tag = OpenTwo | SuccessfulRead
 tagFsAction :: Stats -> LockstepAction FsState a -> FsVal a -> [Tag]
 tagFsAction openedFiles = \case
     Read _ -> \v -> [SuccessfulRead | MEither (Right _) <- [v]]
-    Open _ -> \_ -> [OpenTwo | Set.size openedFiles >= 2]
+    Open _ -> \_ -> [OpenTwo        | Set.size openedFiles >= 2]
     _      -> \_ -> []
 
 {-------------------------------------------------------------------------------

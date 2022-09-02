@@ -202,6 +202,8 @@ lookUpEnvF env (GVar var op) = fromJust $
     EnvF.lookup var env >>= intOp op
 
 -- | Check if the variable is well-defined and evaluation will succeed.
-definedInEnvF :: (Typeable f, InterpretOp op f) => EnvF f -> AnyGVar op -> Bool
-definedInEnvF env (SomeGVar (GVar var op)) = isJust $
+definedInEnvF ::
+     (Typeable f, Typeable a, Show a, Eq a, InterpretOp op f)
+  => EnvF f -> GVar op a -> Bool
+definedInEnvF env (GVar var op) = isJust $
     EnvF.lookup var env >>= intOp op

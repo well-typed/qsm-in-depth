@@ -51,7 +51,7 @@ import Test.QuickCheck.StateModel
 
 import StateModel.Lockstep.EnvF (EnvF)
 import StateModel.Lockstep.EnvF qualified as EnvF
-import StateModel.Lockstep.GVar (GVar, AnyGVar, InterpretOp)
+import StateModel.Lockstep.GVar (GVar, AnyGVar(..), InterpretOp)
 import StateModel.Lockstep.GVar qualified as GVar
 
 {-------------------------------------------------------------------------------
@@ -120,12 +120,12 @@ class
     -> state
     -> (ModelValue state a, state)
 
-  arbitraryActionWithVars ::
+  arbitraryWithVars ::
        ModelFindVariables state
     -> state
     -> Gen (Any (LockstepAction state))
 
-  shrinkActionWithVars ::
+  shrinkWithVars ::
        ModelFindVariables state
     -> state
     -> LockstepAction state a
@@ -164,24 +164,10 @@ type ModelFindVariables state = forall proxy a.
   Internal auxiliary
 -------------------------------------------------------------------------------}
 
--- | Use 'stepModelState' to also update the environment
-stepLockstepState :: forall state a.
-     (InLockstep state, Typeable a)
-  => Lockstep state
-  -> LockstepAction state a
-  -> Var a
-  -> (ModelValue state a, Lockstep state)
-stepLockstepState (Lockstep state env) action var =
-     (modelResp, Lockstep state' (EnvF.insert var modelResp env))
-  where
-    modelResp :: ModelValue state a
-    state'    :: state
-    (modelResp, state') = modelNextState (GVar.lookUpEnvF env) action state
-
-modelFindVariables ::
+varsOfType ::
      InLockstep state
   => EnvF (ModelValue state) -> ModelFindVariables state
-modelFindVariables env p = map GVar.fromVar $ EnvF.keysOfType p env
+varsOfType env p = map GVar.fromVar $ EnvF.keysOfType p env
 
 {-------------------------------------------------------------------------------
   Default implementations for members of 'StateModel'
@@ -195,12 +181,18 @@ initialState state = Lockstep {
     }
 
 -- | Default implementation for 'Test.QuickCheck.StateModel.nextState'
-nextState :: forall state a. (InLockstep state, Typeable a)
+nextState :: forall state a.
+     (InLockstep state, Typeable a)
   => Lockstep state
   -> LockstepAction state a
   -> Var a
   -> Lockstep state
-nextState st action = snd . stepLockstepState st action
+nextState (Lockstep state env) action var =
+    Lockstep state' $ EnvF.insert var modelResp env
+  where
+    modelResp :: ModelValue state a
+    state'    :: state
+    (modelResp, state') = modelNextState (GVar.lookUpEnvF env) action state
 
 -- | Default implementation for 'Test.QuickCheck.StateModel.precondition'
 --
@@ -209,7 +201,8 @@ nextState st action = snd . stepLockstepState st action
 precondition ::
      InLockstep state
   => Lockstep state -> LockstepAction state a -> Bool
-precondition (Lockstep _ env) = all (GVar.definedInEnvF env) . usedVars
+precondition (Lockstep _ env) =
+    all (\(SomeGVar var) -> GVar.definedInEnvF env var) . usedVars
 
 -- | Default implementation for 'Test.QuickCheck.StateModel.postcondition'
 --
@@ -239,14 +232,14 @@ arbitraryAction ::
      InLockstep state
   => Lockstep state -> Gen (Any (LockstepAction state))
 arbitraryAction (Lockstep state env) =
-    arbitraryActionWithVars (modelFindVariables env) state
+    arbitraryWithVars (varsOfType env) state
 
 shrinkAction ::
      InLockstep state
   => Lockstep state
   -> LockstepAction state a -> [Any (LockstepAction state)]
 shrinkAction (Lockstep state env) =
-    shrinkActionWithVars (modelFindVariables env) state
+    shrinkWithVars (varsOfType env) state
 
 monitoring :: forall state a.
      (InLockstep state, Show a)
@@ -295,16 +288,29 @@ tagActions _proxy (Actions steps) =
     go Set.empty Test.QuickCheck.StateModel.initialState steps
   where
     go :: Set String -> Lockstep state -> [Step (Lockstep state)] -> Property
-    go tags _state []     = label ("Tags: " ++ show (Set.toList tags)) True
-    go tags  state (s:ss) =
-        case s of
-          var := action ->
-            let (modelResp, state') = stepLockstepState state action var
-                tags' = tagStep
-                          (lockstepModel state, lockstepModel state')
-                          action
-                          modelResp
-            in go (Set.union (Set.fromList tags') tags) state' ss
+    go tags _st []            = label ("Tags: " ++ show (Set.toList tags)) True
+    go tags  st ((v:=a) : ss) = go' tags st v a ss
+
+    go' :: forall a.
+         (Typeable a, Show a)
+      => Set String                 -- accumulated set of tags
+      -> Lockstep state             -- current state
+      -> Var a                      -- variable for the result of this action
+      -> Action (Lockstep state) a  -- action to execute
+      -> [Step (Lockstep state)]    -- remaining steps to execute
+      -> Property
+    go' tags (Lockstep before env) var action ss =
+        go (Set.union (Set.fromList tags') tags) st' ss
+      where
+        st' :: Lockstep state
+        st' = Lockstep after (EnvF.insert var modelResp env)
+
+        modelResp :: ModelValue state a
+        after     :: state
+        (modelResp, after) = modelNextState (GVar.lookUpEnvF env) action before
+
+        tags' :: [String]
+        tags' = tagStep (before, after) action modelResp
 
 {-------------------------------------------------------------------------------
   Auxiliary QuickCheck
