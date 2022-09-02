@@ -66,5 +66,5 @@ lookup = \var (EnvF env) ->
         guard (x == y)
         cast fa'
 
-keysOfType :: forall proxy f a. Typeable a => proxy a -> EnvF f -> [Var a]
+keysOfType :: Typeable a => proxy a -> EnvF f -> [Var a]
 keysOfType _ (EnvF env) = mapMaybe (\(EnvEntry var _) -> cast var) env

@@ -1,7 +1,6 @@
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE GADTs                 #-}
 {-# LANGUAGE ImportQualifiedPost   #-}
-{-# LANGUAGE KindSignatures        #-}
 {-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE QuantifiedConstraints #-}
@@ -41,21 +40,21 @@ module StateModel.Lockstep.GVar (
 import Prelude hiding (map)
 
 import Control.Monad
-import Data.Either (isRight)
 import Data.Functor.Identity
-import Data.Kind
+import Data.Maybe (isJust, fromJust)
 import Data.Typeable
 
 import Test.QuickCheck.StateModel (Var(..), LookUp)
 
 import StateModel.Lockstep.EnvF (EnvF)
 import StateModel.Lockstep.EnvF qualified as EnvF
+import GHC.Show (appPrec)
 
 {-------------------------------------------------------------------------------
   Main type
 -------------------------------------------------------------------------------}
 
-data GVar :: (Type -> Type -> Type) -> Type -> Type where
+data GVar op f where
   GVar :: (Show x, Typeable x, Eq x) => Var x -> op x y -> GVar op y
 
 data AnyGVar op where
@@ -84,13 +83,13 @@ instance (forall x. Eq (op x a)) => Eq (GVar op a) where
      and for real values.
 -------------------------------------------------------------------------------}
 
-class Operation (op :: Type -> Type -> Type) where
-  opIdentity  :: op a a
+class Operation op where
+  opIdentity :: op a a
 
-class Operation op => InterpretOp op (f :: Type -> Type) where
+class Operation op => InterpretOp op f where
   intOp ::
        (Show a, Show b, Typeable a, Typeable b, Eq a, Eq b)
-    => op a b -> f a -> Either String (f b)
+    => op a b -> f a -> Maybe (f b)
 
 {-------------------------------------------------------------------------------
   Example (but very useful) 'Operation' example
@@ -141,20 +140,31 @@ instance Eq (Op a b) where
           OpRight  -> ()
           OpComp{} -> ()
 
-deriving instance Show (Op a b)
+instance Show (Op a b) where
+  showsPrec p = \op -> case op of
+      OpComp{} -> showParen (p > appPrec) (go op)
+      _        -> go op
+    where
+      go :: Op x y -> String -> String
+      go OpId         = showString "id"
+      go OpFst        = showString "fst"
+      go OpSnd        = showString "snd"
+      go OpLeft       = showString "fromLeft"
+      go OpRight      = showString "fromRight"
+      go (OpComp g f) = go g . showString " . " . go f
 
-instance Operation (Op) where
+instance Operation Op where
   opIdentity = OpId
 
-instance InterpretOp (Op) Identity where
+instance InterpretOp Op Identity where
   intOp = \op -> fmap Identity . go op . runIdentity
     where
-      go :: Op a b -> a -> Either String b
-      go OpId         = Right
-      go OpFst        = Right . fst
-      go OpSnd        = Right . snd
-      go OpLeft       = either Right (const $ Left "Not Left")
-      go OpRight      = either (const $ Left "Not Right") Right
+      go :: Op a b -> a -> Maybe b
+      go OpId         = Just
+      go OpFst        = Just . fst
+      go OpSnd        = Just . snd
+      go OpLeft       = either Just (const Nothing)
+      go OpRight      = either (const Nothing) Just
       go (OpComp g f) = go g <=< go f
 
 {-------------------------------------------------------------------------------
@@ -171,21 +181,27 @@ map f (GVar var op) = GVar var (f op)
   Interaction with 'Env' and 'EnvF'
 -------------------------------------------------------------------------------}
 
+-- | Lookup 'GVar' given a lookup function for 'Var'
+--
+-- The variable must be in the environment and evaluation must succeed.
+-- This is normally guaranteed by the default test 'precondition'.
 lookUpEnv ::
      (InterpretOp op Identity, Show a, Typeable a, Eq a)
-  => LookUp -> GVar op a -> Either String a
+  => LookUp -> GVar op a -> a
 lookUpEnv lookUp (GVar var op) =
-    fmap runIdentity $ intOp op (Identity (lookUp var))
+    fromJust $ fmap runIdentity $ intOp op (Identity (lookUp var))
 
+-- | Lookup 'GVar'
+--
+-- The variable must be in the environment and evaluation must succeed.
+-- This is normally guaranteed by the default test 'precondition'.
 lookUpEnvF ::
       (Typeable f, Typeable a, Show a, Eq a, InterpretOp op f)
-   => GVar op a -> EnvF f -> Either String (f a)
-lookUpEnvF (GVar var op) env =
-    case EnvF.lookup var env of
-      Nothing  -> Left $ "Variable " ++ show var ++ " not in the environment"
-      Just val -> intOp op val
+   => EnvF f -> GVar op a -> f a
+lookUpEnvF env (GVar var op) = fromJust $
+    EnvF.lookup var env >>= intOp op
 
-definedInEnvF :: forall op f.
-     (Typeable f, InterpretOp op f)
-  => EnvF f -> AnyGVar op -> Bool
-definedInEnvF env (SomeGVar var) = isRight (lookUpEnvF var env)
+-- | Check if the variable is well-defined and evaluation will succeed.
+definedInEnvF :: (Typeable f, InterpretOp op f) => EnvF f -> AnyGVar op -> Bool
+definedInEnvF env (SomeGVar (GVar var op)) = isJust $
+    EnvF.lookup var env >>= intOp op

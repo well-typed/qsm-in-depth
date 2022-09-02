@@ -15,7 +15,7 @@
 -- > import StateModel.Lockstep qualified as Lockstep
 module StateModel.Lockstep (
     InLockstep(..)
-  , Lockstep(..)
+  , Lockstep -- opaque
   , LockstepAction
   , ModelVar
   , ModelLookUp
@@ -34,11 +34,16 @@ module StateModel.Lockstep (
   , StateModel.Lockstep.labelledExamples
   ) where
 
+import Prelude hiding (init)
+
+import Control.Exception
 import Control.Monad
+import Control.Monad.Reader
 import Data.Kind
 import Data.Set (Set)
 import Data.Typeable
 import qualified Data.Set as Set
+import Test.QuickCheck.Gen.Unsafe
 
 import Test.QuickCheck
 import Test.QuickCheck.Monadic
@@ -55,7 +60,7 @@ import StateModel.Lockstep.GVar qualified as GVar
 
 data Lockstep state = Lockstep {
       lockstepModel :: state
-    , lockstepEnvF  :: EnvF (ModelValue state)
+    , lockstepEnv   :: EnvF (ModelValue state)
     }
   deriving (Show)
 
@@ -136,7 +141,7 @@ class
 -- | An action in the lock-step model
 type LockstepAction state = Action (Lockstep state)
 
--- | Variables with a "functor-like" instance
+-- | Variables with a "functor-esque" instance
 type ModelVar state = GVar (ModelOp state)
 
 -- | Look up a variable for model execution
@@ -159,21 +164,6 @@ type ModelFindVariables state = forall proxy a.
   Internal auxiliary
 -------------------------------------------------------------------------------}
 
--- | Think wrapper around 'modelNextState' that constructs the lookup function
-stepModelState :: forall state a.
-     InLockstep state
-  => Lockstep state
-  -> LockstepAction state a
-  -> (ModelValue state a, state)
-stepModelState (Lockstep state env) action =
-    modelNextState modelLookUp action state
-  where
-    modelLookUp :: ModelLookUp state
-    modelLookUp x =
-        case GVar.lookUpEnvF x env of
-          Left  err -> error err -- Ruled out by the precondition
-          Right val -> val
-
 -- | Use 'stepModelState' to also update the environment
 stepLockstepState :: forall state a.
      (InLockstep state, Typeable a)
@@ -181,25 +171,17 @@ stepLockstepState :: forall state a.
   -> LockstepAction state a
   -> Var a
   -> (ModelValue state a, Lockstep state)
-stepLockstepState st@(Lockstep _ env) action var =
+stepLockstepState (Lockstep state env) action var =
      (modelResp, Lockstep state' (EnvF.insert var modelResp env))
   where
     modelResp :: ModelValue state a
     state'    :: state
-    (modelResp, state') = stepModelState st action
+    (modelResp, state') = modelNextState (GVar.lookUpEnvF env) action state
 
 modelFindVariables ::
      InLockstep state
   => EnvF (ModelValue state) -> ModelFindVariables state
 modelFindVariables env p = map GVar.fromVar $ EnvF.keysOfType p env
-
--- | Thin wrapper around 'monadicIO' that allows a separate initialation step
---
--- This is useful when testing stateful code that requires a single setup
--- call before the tests are run (the initializer will be run for every test,
--- including for every shrunk test).
-monadicInit :: Testable b => IO a -> (a -> PropertyM IO b) -> Property
-monadicInit initState prop = monadicIO $ run initState >>= prop
 
 {-------------------------------------------------------------------------------
   Default implementations for members of 'StateModel'
@@ -209,7 +191,7 @@ monadicInit initState prop = monadicIO $ run initState >>= prop
 initialState :: state -> Lockstep state
 initialState state = Lockstep {
       lockstepModel = state
-    , lockstepEnvF  = EnvF.empty
+    , lockstepEnv   = EnvF.empty
     }
 
 -- | Default implementation for 'Test.QuickCheck.StateModel.nextState'
@@ -236,11 +218,11 @@ precondition (Lockstep _ env) = all (GVar.definedInEnvF env) . usedVars
 postcondition :: forall state a.
      InLockstep state
   => Lockstep state -> LockstepAction state a -> LookUp -> a -> Maybe String
-postcondition st action _lookUp a =
+postcondition (Lockstep state env) action _lookUp a =
     compareEquality (observeReal action a) (observeModel modelResp)
   where
     modelResp :: ModelValue state a
-    modelResp = fst $ stepModelState st action
+    modelResp = fst $ modelNextState (GVar.lookUpEnvF env) action state
 
     compareEquality ::  Observable state a -> Observable state a -> Maybe String
     compareEquality real mock
@@ -281,7 +263,10 @@ monitoring (before, after) action _lookUp _realResp =
     tags = tagStep (lockstepModel before, lockstepModel after) action modelResp
 
     modelResp :: ModelValue state a
-    modelResp = fst $ stepModelState before action
+    modelResp = fst $ modelNextState
+                        (GVar.lookUpEnvF $ lockstepEnv before)
+                        action
+                        (lockstepModel before)
 
 {-------------------------------------------------------------------------------
   Finding labelled examples
@@ -322,6 +307,42 @@ tagActions _proxy (Actions steps) =
             in go (Set.union (Set.fromList tags') tags) state' ss
 
 {-------------------------------------------------------------------------------
+  Auxiliary QuickCheck
+-------------------------------------------------------------------------------}
+
+ioPropertyBracket ::
+     Testable a
+  => IO st
+  -> (st -> IO ())
+  -> ReaderT st IO a
+  -> Property
+ioPropertyBracket init cleanup (ReaderT prop) = do
+    ioProperty $ mask $ \restore -> do
+      st <- init
+      a  <- restore (prop st) `onException` cleanup st
+      cleanup st
+      return a
+
+-- | Variation on 'monadicIO' that allows for state initialisation/cleanup
+monadicBracketIO :: forall st a.
+     Testable a
+  => IO st
+  -> (st -> IO ())
+  -> (st -> PropertyM IO a)
+  -> Property
+monadicBracketIO init cleanup prop =
+    monadic (ioPropertyBracket init cleanup) $ hoistReaderT prop
+
+hoistReaderT :: forall m r a. (r -> PropertyM m a) -> PropertyM (ReaderT r m) a
+hoistReaderT prop =
+    MkPropertyM $ \k -> fmap ReaderT $ aux (fmap runReaderT . k)
+  where
+    aux :: (a -> Gen (r -> m Property)) -> Gen (r -> m Property)
+    aux k = do
+        eval <- delay
+        pure $ \r -> eval $ (unPropertyM $ prop r) (fmap ($ r) . k)
+
+{-------------------------------------------------------------------------------
   Utilities for running the tests
 -------------------------------------------------------------------------------}
 
@@ -331,11 +352,12 @@ tagActions _proxy (Actions steps) =
 -- state initialization step.
 runActions ::
      StateModel state
-  => IO st
-  -> (st -> RunModel state IO)
+  => IO st                     -- ^ Initialisation
+  -> (st -> IO ())             -- ^ Cleanup
+  -> (st -> RunModel state IO) -- ^ Interpreter
   -> Actions state -> Property
-runActions initState runner actions =
-    monadicInit initState $ \st ->
+runActions init cleanup runner actions =
+    monadicBracketIO init cleanup $ \st ->
       void $ Test.QuickCheck.StateModel.runActions (runner st) actions
 
 labelledExamples :: InLockstep state => proxy state -> IO ()
