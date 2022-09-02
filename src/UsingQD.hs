@@ -73,6 +73,22 @@ instance StateModel (Lockstep State) where
   arbitraryAction = Lockstep.arbitraryAction
   monitoring      = Lockstep.monitoring
 
+  shrinkAction ::
+       (Show a, Typeable a)
+    => Lockstep State
+    -> LockstepAction State a
+    -> [Any (LockstepAction State)]
+  shrinkAction _ = \case
+      Open (File (Dir []) ('t' : n)) ->
+        [openTemp n' | n' <- QC.shrink (read n)]
+      Open _ ->
+        [openTemp 100]
+      _otherwise ->
+        []
+    where
+      openTemp :: Int -> Any (LockstepAction State)
+      openTemp n = Some $ Open (File (Dir []) ('t' : show n))
+
 deriving instance Show (Action (Lockstep State) a)
 deriving instance Eq   (Action (Lockstep State) a)
 
