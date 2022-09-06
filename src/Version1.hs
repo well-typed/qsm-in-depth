@@ -35,9 +35,8 @@ import Data.Bifunctor
 import Data.Foldable          (toList)
 import Data.Functor.Classes
 import Data.Maybe             (catMaybes, fromJust)
-import Data.Monoid            ((<>))
 import Data.Set               (Set)
-import Data.TreeDiff          (ToExpr (..), defaultExprViaShow)
+import Data.TreeDiff          (defaultExprViaShow)
 import Data.Typeable
 import GHC.Generics           (Generic)
 import System.IO.Temp         (createTempDirectory)

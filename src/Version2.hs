@@ -26,9 +26,8 @@ import Data.Bifunctor
 import Data.Bitraversable
 import Data.Functor.Classes
 import Data.Maybe             (catMaybes, fromJust, mapMaybe)
-import Data.Monoid            ((<>))
 import Data.Set               (Set)
-import Data.TreeDiff          (ToExpr (..), defaultExprViaShow)
+import Data.TreeDiff          (defaultExprViaShow)
 import GHC.Generics           (Generic)
 import System.IO.Temp         (createTempDirectory)
 import System.Random          (getStdRandom, randomR)

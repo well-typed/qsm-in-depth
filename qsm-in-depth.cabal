@@ -15,10 +15,6 @@ executable qsm-in-depth
   main-is:             Main.hs
   other-modules:       Version1
                        Version2
-                       UsingQD
-                       StateModel.Lockstep
-                       StateModel.Lockstep.EnvF
-                       StateModel.Lockstep.GVar
                        Mock
   build-depends:       base >=4.10
                      , bifunctors
@@ -39,3 +35,4 @@ executable qsm-in-depth
                      , tree-diff
   hs-source-dirs:      src
   default-language:    Haskell2010
+  ghc-options:         -Wall

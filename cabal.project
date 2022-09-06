@@ -1,0 +1,7 @@
+packages: .
+
+source-repository-package
+  type: git
+  location: git@github.com:stevana/quickcheck-state-machine.git
+  tag: 1fce865f1c7b74cc7684c944657ac4fa75d50530
+
