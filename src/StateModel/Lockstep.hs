@@ -40,6 +40,7 @@ import Control.Exception
 import Control.Monad
 import Control.Monad.Reader
 import Data.Kind
+import Data.Maybe (isNothing)
 import Data.Set (Set)
 import Data.Typeable
 import qualified Data.Set as Set
@@ -169,6 +170,29 @@ varsOfType ::
   => EnvF (ModelValue state) -> ModelFindVariables state
 varsOfType env p = map GVar.fromVar $ EnvF.keysOfType p env
 
+-- | Check the response of the system under test against the model
+--
+-- This is used in 'postcondition', where we can however only return a 'Bool',
+-- and in 'monitoring', to give the user more detailed feedback.
+checkResponse :: forall state a.
+     InLockstep state
+  => Lockstep state -> LockstepAction state a -> a -> Maybe String
+checkResponse (Lockstep state env) action a =
+    compareEquality (observeReal action a) (observeModel modelResp)
+  where
+    modelResp :: ModelValue state a
+    modelResp = fst $ modelNextState (GVar.lookUpEnvF env) action state
+
+    compareEquality ::  Observable state a -> Observable state a -> Maybe String
+    compareEquality real mock
+      | real == mock = Nothing
+      | otherwise    = Just $ concat [
+            "System under test returned "
+          , show real
+          , " but model returned "
+          , show mock
+          ]
+
 {-------------------------------------------------------------------------------
   Default implementations for members of 'StateModel'
 -------------------------------------------------------------------------------}
@@ -210,22 +234,9 @@ precondition (Lockstep _ env) =
 -- return the same results, up to " observability ".
 postcondition :: forall state a.
      InLockstep state
-  => Lockstep state -> LockstepAction state a -> LookUp -> a -> Maybe String
-postcondition (Lockstep state env) action _lookUp a =
-    compareEquality (observeReal action a) (observeModel modelResp)
-  where
-    modelResp :: ModelValue state a
-    modelResp = fst $ modelNextState (GVar.lookUpEnvF env) action state
-
-    compareEquality ::  Observable state a -> Observable state a -> Maybe String
-    compareEquality real mock
-      | real == mock = Nothing
-      | otherwise    = Just $ concat [
-            "System under test returned "
-          , show real
-          , " but model returned "
-          , show mock
-          ]
+  => Lockstep state -> LockstepAction state a -> LookUp -> a -> Bool
+postcondition state action _lookUp a =
+    isNothing $ checkResponse state action a
 
 -- | Default implementation for 'Test.QuickCheck.StateModel.arbitraryAction'
 arbitraryAction ::
@@ -248,8 +259,9 @@ monitoring :: forall state a.
   -> LookUp
   -> a
   -> Property -> Property
-monitoring (before, after) action _lookUp _realResp =
-      counterexample ("State: " ++ show after)
+monitoring (before, after) action _lookUp realResp =
+      maybe id counterexample (checkResponse before action realResp)
+    . counterexample ("State: " ++ show after)
     . tabulate "Tags" tags
   where
     tags :: [String]
